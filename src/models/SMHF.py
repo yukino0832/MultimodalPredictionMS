@@ -86,8 +86,12 @@ class SMHF(nn.Module):
         super(SMHF, self).__init__()
         
         # Backbones
-        resnet_mg = models.resnet50(pretrained=True)
-        resnet_us = models.resnet50(pretrained=True)
+        resnet_mg = models.resnet18(pretrained=True)
+        resnet_us = models.resnet18(pretrained=True)
+        # resnet_mg = models.resnet34(pretrained=True)
+        # resnet_us = models.resnet34(pretrained=True)
+        # resnet_mg = models.resnet50(pretrained=True)
+        # resnet_us = models.resnet50(pretrained=True)
         
         # Extract up to layer3 (conv4_x). Output channels: 1024.
         self.mg_stream = nn.Sequential(

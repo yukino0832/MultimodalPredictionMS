@@ -1,12 +1,14 @@
 import os
 import yaml
 import argparse
+import csv
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, recall_score, precision_score, roc_auc_score
 import numpy as np
 from tqdm import tqdm
 
@@ -40,7 +42,7 @@ def train(args):
     
     model = SMHF(num_classes=4).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
@@ -53,11 +55,19 @@ def train(args):
     save_dir = 'checkpoints'
     os.makedirs(save_dir, exist_ok=True)
     
+    # Initialize CSV logging
+    csv_path = os.path.join(save_dir, 'training_metrics.csv')
+    with open(csv_path, 'w', newline='') as f:
+        writer_csv = csv.writer(f)
+        writer_csv.writerow(['Epoch', 'Train_Loss', 'Train_Acc', 'Train_F1', 'Train_Rec', 'Train_Pre', 'Train_AUC',
+                             'Val_Loss', 'Val_Acc', 'Val_F1', 'Val_Rec', 'Val_Pre', 'Val_AUC'])
+    
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
         all_preds = []
         all_labels = []
+        all_probs = []
         
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
         for batch in loop:
@@ -69,6 +79,7 @@ def train(args):
             img_mlo = img_mlo.to(device)
             img_us = img_us.to(device)
             labels = labels.to(device)
+            clinical = clinical.to(device)
             
             optimizer.zero_grad()
             
@@ -80,24 +91,36 @@ def train(args):
             
             running_loss += loss.item() * labels.size(0)
             preds = torch.argmax(outputs, dim=1)
+            probs = F.softmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().detach().numpy())
             
             loop.set_postfix(loss=loss.item())
             
         epoch_loss = running_loss / len(train_dataset)
         epoch_acc = accuracy_score(all_labels, all_preds)
         epoch_f1 = f1_score(all_labels, all_preds, average='macro')
+        epoch_rec = recall_score(all_labels, all_preds, average='macro')
+        epoch_pre = precision_score(all_labels, all_preds, average='macro')
+        try:
+            epoch_auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
+        except ValueError:
+            epoch_auc = 0.0
         
         writer.add_scalar('Loss/train', epoch_loss, epoch)
         writer.add_scalar('Accuracy/train', epoch_acc, epoch)
         writer.add_scalar('F1/train', epoch_f1, epoch)
+        writer.add_scalar('Recall/train', epoch_rec, epoch)
+        writer.add_scalar('Precision/train', epoch_pre, epoch)
+        writer.add_scalar('AUC/train', epoch_auc, epoch)
         writer.add_scalar('LR', scheduler.get_last_lr()[0], epoch)
         
         model.eval()
         val_loss = 0.0
         val_preds = []
         val_labels = []
+        val_probs = []
         
         with torch.no_grad():
             for batch in val_loader:
@@ -107,26 +130,44 @@ def train(args):
                 img_mlo = img_mlo.to(device)
                 img_us = img_us.to(device)
                 labels = labels.to(device)
+                clinical = clinical.to(device)
                 
-                outputs = model(img_mlo, img_cc, img_us)
+                outputs = model(img_mlo, img_cc, img_us, clinical)
                 loss = criterion(outputs, labels)
                 
                 val_loss += loss.item() * labels.size(0)
                 preds = torch.argmax(outputs, dim=1)
+                probs = F.softmax(outputs, dim=1)
                 val_preds.extend(preds.cpu().numpy())
                 val_labels.extend(labels.cpu().numpy())
+                val_probs.extend(probs.cpu().detach().numpy())
         
         val_loss = val_loss / len(val_dataset)
         val_acc = accuracy_score(val_labels, val_preds)
         val_f1 = f1_score(val_labels, val_preds, average='macro')
+        val_rec = recall_score(val_labels, val_preds, average='macro')
+        val_pre = precision_score(val_labels, val_preds, average='macro')
+        try:
+            val_auc = roc_auc_score(val_labels, val_probs, multi_class='ovr', average='macro')
+        except ValueError:
+            val_auc = 0.0
         
         print(f"Epoch {epoch+1} Results:")
-        print(f"Train - Loss: {epoch_loss:.4f}, Acc: {epoch_acc:.4f}, F1: {epoch_f1:.4f}")
-        print(f"Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}")
+        print(f"Train - Loss: {epoch_loss:.4f}, Acc: {epoch_acc:.4f}, F1: {epoch_f1:.4f}, Rec: {epoch_rec:.4f}, Pre: {epoch_pre:.4f}, AUC: {epoch_auc:.4f}")
+        print(f"Val   - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Rec: {val_rec:.4f}, Pre: {val_pre:.4f}, AUC: {val_auc:.4f}")
         
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('Accuracy/val', val_acc, epoch)
         writer.add_scalar('F1/val', val_f1, epoch)
+        writer.add_scalar('Recall/val', val_rec, epoch)
+        writer.add_scalar('Precision/val', val_pre, epoch)
+        writer.add_scalar('AUC/val', val_auc, epoch)
+
+        # Save metrics to CSV
+        with open(csv_path, 'a', newline='') as f:
+            writer_csv = csv.writer(f)
+            writer_csv.writerow([epoch+1, epoch_loss, epoch_acc, epoch_f1, epoch_rec, epoch_pre, epoch_auc,
+                                 val_loss, val_acc, val_f1, val_rec, val_pre, val_auc])
         
         scheduler.step()
         
