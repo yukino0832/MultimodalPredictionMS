@@ -49,16 +49,22 @@ def train(args):
     
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
     
-    writer = SummaryWriter(log_dir='runs/mdl_iia_experiment')
+    import datetime
+    
+    start_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    experiment_name = f"{start_time}_{args.backbone}"
+    
+    save_dir = os.path.join('checkpoints', experiment_name)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    log_dir = os.path.join('runs', experiment_name)
+    writer = SummaryWriter(log_dir=log_dir)
     
     # Initialize GradScaler for AMP
     scaler = GradScaler()
     
     epochs = args.num_epochs
     best_val_f1 = 0.0
-    
-    save_dir = 'checkpoints'
-    os.makedirs(save_dir, exist_ok=True)
     
     # Initialize CSV logging
     csv_path = os.path.join(save_dir, 'training_metrics.csv')
@@ -190,6 +196,16 @@ def train(args):
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             torch.save(model.state_dict(), os.path.join(save_dir, 'best_model.pth'))
+            
+            best_metrics_path = os.path.join(save_dir, 'best_metrics.txt')
+            with open(best_metrics_path, 'w') as f_best:
+                f_best.write(f"Best Model Metrics (Epoch {epoch+1}):\n")
+                f_best.write(f"Accuracy: {val_acc:.4f}\n")
+                f_best.write(f"F1 Score: {val_f1:.4f}\n")
+                f_best.write(f"Recall: {val_rec:.4f}\n")
+                f_best.write(f"Precision: {val_pre:.4f}\n")
+                f_best.write(f"AUC: {val_auc:.4f}\n")
+            
             print("Saved Best Model!")
             
     writer.close()
