@@ -11,6 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, recall_score, precision_score, roc_auc_score
 import numpy as np
 from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 
 from models.SMHF import SMHF
 from dataloader.load_data import split_dataset, MyDataset
@@ -40,7 +41,8 @@ def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    model = SMHF(num_classes=4).to(device)
+    # Initialize model with selected backbone
+    model = SMHF(num_classes=4, backbone=args.backbone).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
@@ -48,6 +50,9 @@ def train(args):
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
     
     writer = SummaryWriter(log_dir='runs/mdl_iia_experiment')
+    
+    # Initialize GradScaler for AMP
+    scaler = GradScaler()
     
     epochs = args.num_epochs
     best_val_f1 = 0.0
@@ -83,11 +88,15 @@ def train(args):
             
             optimizer.zero_grad()
             
-            outputs = model(img_mlo, img_cc, img_us, clinical)
-            loss = criterion(outputs, labels)
+            # Use autocast for mixed precision training
+            with autocast():
+                outputs = model(img_mlo, img_cc, img_us, clinical)
+                loss = criterion(outputs, labels)
             
-            loss.backward()
-            optimizer.step()
+            # Scale loss and backward
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             running_loss += loss.item() * labels.size(0)
             preds = torch.argmax(outputs, dim=1)
@@ -104,7 +113,11 @@ def train(args):
         epoch_rec = recall_score(all_labels, all_preds, average='macro')
         epoch_pre = precision_score(all_labels, all_preds, average='macro')
         try:
-            epoch_auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
+            if args.num_classes == 2:
+                # For binary classification, use probability of positive class
+                epoch_auc = roc_auc_score(all_labels, np.array(all_probs)[:, 1])
+            else:
+                epoch_auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
         except ValueError:
             epoch_auc = 0.0
         
@@ -148,7 +161,10 @@ def train(args):
         val_rec = recall_score(val_labels, val_preds, average='macro')
         val_pre = precision_score(val_labels, val_preds, average='macro')
         try:
-            val_auc = roc_auc_score(val_labels, val_probs, multi_class='ovr', average='macro')
+            if args.num_classes == 2:
+                val_auc = roc_auc_score(val_labels, np.array(val_probs)[:, 1])
+            else:
+                val_auc = roc_auc_score(val_labels, val_probs, multi_class='ovr', average='macro')
         except ValueError:
             val_auc = 0.0
         
@@ -185,6 +201,10 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--backbone', type=str, default='resnet18', 
+                        choices=['resnet18', 'resnet34', 'resnet50', 'densenet121', 'inceptionv3'],
+                        help='Backbone model for feature extraction')
+    parser.add_argument('--num_classes', type=int, default=2, help='Number of classes for classification')
     args = parser.parse_args()
     
     train(args)

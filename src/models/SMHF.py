@@ -52,13 +52,18 @@ class BottleneckBlock(nn.Module):
 
 class DownsamplingModel(nn.Module):
     """
-    Input: (32, 32, 1024) -> Output: (16, 16, 2048)
+    Input: (H, W, C_in) -> Output: (H/2, W/2, C_out) C_out = C_in * 2
     """
     def __init__(self, in_channels):
         super(DownsamplingModel, self).__init__()
-        # filters=[512, 512, 2048]
-        filters = [512, 512, 2048]
         
+        f3 = in_channels * 2
+        f1 = f3 // 4
+        f2 = f3 // 4
+        
+        filters = [f1, f2, f3]
+        
+        # stride=2 in block1 does downsampling
         self.block1 = BottleneckBlock(in_channels, filters, stride=2, with_conv_shortcut=True)
         self.block2 = BottleneckBlock(filters[2], filters, stride=1, with_conv_shortcut=False)
         self.block3 = BottleneckBlock(filters[2], filters, stride=1, with_conv_shortcut=False)
@@ -82,58 +87,112 @@ class MetaFusion(nn.Module):
         return out
 
 class SMHF(nn.Module):
-    def __init__(self, num_classes=4):
+    def __init__(self, num_classes=2, backbone='resnet18'):
         super(SMHF, self).__init__()
         
-        # Backbones
-        resnet_mg = models.resnet18(pretrained=True)
-        resnet_us = models.resnet18(pretrained=True)
-        # resnet_mg = models.resnet34(pretrained=True)
-        # resnet_us = models.resnet34(pretrained=True)
-        # resnet_mg = models.resnet50(pretrained=True)
-        # resnet_us = models.resnet50(pretrained=True)
+        self.backbone_name = backbone
         
-        # Extract up to layer3 (conv4_x). Output channels: 1024.
-        self.mg_stream = nn.Sequential(
-            resnet_mg.conv1,
-            resnet_mg.bn1,
-            resnet_mg.relu,
-            resnet_mg.maxpool,
-            resnet_mg.layer1,
-            resnet_mg.layer2,
-            resnet_mg.layer3
-        )
+        def get_resnet_layers(resnet_model):
+            layers = [
+                resnet_model.conv1,
+                resnet_model.bn1,
+                resnet_model.relu,
+                resnet_model.maxpool,
+                resnet_model.layer1,
+                resnet_model.layer2,
+                resnet_model.layer3
+            ]
+            return nn.Sequential(*layers)
+
+        def get_densenet_layers(densenet_model):
+            layers = []
+            features = densenet_model.features
+            for name, module in features.named_children():
+                if name == 'transition3':
+                    break
+                layers.append(module)
+            return nn.Sequential(*layers)
+
+        def get_inception_layers(inception_model):
+            layers = [
+                inception_model.Conv2d_1a_3x3,
+                inception_model.Conv2d_2a_3x3,
+                inception_model.Conv2d_2b_3x3,
+                inception_model.maxpool1,
+                inception_model.Conv2d_3b_1x1,
+                inception_model.Conv2d_4a_3x3,
+                inception_model.maxpool2,
+                inception_model.Mixed_5b,
+                inception_model.Mixed_5c,
+                inception_model.Mixed_5d,
+                inception_model.Mixed_6a,
+                inception_model.Mixed_6b,
+                inception_model.Mixed_6c,
+                inception_model.Mixed_6d,
+                inception_model.Mixed_6e
+            ]
+            return nn.Sequential(*layers)
+
+        # Initialize backbones
+        if 'resnet' in backbone:
+            if backbone == 'resnet18':
+                resnet_mg = models.resnet18(pretrained=True)
+                resnet_us = models.resnet18(pretrained=True)
+            elif backbone == 'resnet34':
+                resnet_mg = models.resnet34(pretrained=True)
+                resnet_us = models.resnet34(pretrained=True)
+            elif backbone == 'resnet50':
+                resnet_mg = models.resnet50(pretrained=True)
+                resnet_us = models.resnet50(pretrained=True)
+            else:
+                raise ValueError(f"Unsupported resnet backbone: {backbone}")
+            
+            self.mg_stream = get_resnet_layers(resnet_mg)
+            self.us_stream = get_resnet_layers(resnet_us)
+            
+        elif backbone == 'densenet121':
+            densenet_mg = models.densenet121(pretrained=True)
+            densenet_us = models.densenet121(pretrained=True)
+            self.mg_stream = get_densenet_layers(densenet_mg)
+            self.us_stream = get_densenet_layers(densenet_us)
+            
+        elif backbone == 'inceptionv3':
+            inception_mg = models.inception_v3(pretrained=True)
+            inception_us = models.inception_v3(pretrained=True)
+            self.mg_stream = get_inception_layers(inception_mg)
+            self.us_stream = get_inception_layers(inception_us)
         
-        self.us_stream = nn.Sequential(
-            resnet_us.conv1,
-            resnet_us.bn1,
-            resnet_us.relu,
-            resnet_us.maxpool,
-            resnet_us.layer1,
-            resnet_us.layer2,
-            resnet_us.layer3
-        )
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone}")
+
+        # Determine backbone output channels dynamically
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 512, 512)
+            dummy_out = self.mg_stream(dummy_input)
+            self.backbone_channels = dummy_out.shape[1]
+            print(f"Backbone: {backbone}, Output Channels: {self.backbone_channels}")
+            
+        C = self.backbone_channels
         
-        self.sa1 = SelfAttention(1024)
+        self.sa1 = SelfAttention(C)
         
         # Downsampling Models
-        self.ds_11 = DownsamplingModel(1024)
-        self.ds_12 = DownsamplingModel(1024)
+        self.ds_11 = DownsamplingModel(C)
+        self.ds_12 = DownsamplingModel(C)
         
         # US Branch
-        self.sa2 = SelfAttention(1024)
-        self.ds_us = DownsamplingModel(1024)
+        self.sa2 = SelfAttention(C)
+        self.ds_us = DownsamplingModel(C)
         
-        # Inter-modality Attention
-        # Inputs: x11, x12, x2. Each (B, 2048, 16, 16).
-        # PyTorch: concat dim 3 (W).
-        self.sa3 = SelfAttention(2048)
+        C_down = C * 2
+        self.C_down = C_down
+        
+        self.sa3 = SelfAttention(C_down)
         
         # CSA
-        self.csa = CSA(in_channels=2048*3)
+        self.csa = CSA(in_channels=3 * C_down)
         
         # Classifier
-        # Global Avg Pooling for each branch (x31, x32, x33).
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         
         self.cl = nn.Sequential(
@@ -145,10 +204,10 @@ class SMHF(nn.Module):
             nn.ReLU()
         )
         
-        self.mf = MetaFusion(img_dim=2048*3, meta_dim=128)
+        self.mf = MetaFusion(img_dim=3 * C_down, meta_dim=128)
         
         self.fc = nn.Sequential(
-            nn.Linear(2048*3 + 128, 512),
+            nn.Linear(3 * C_down + 128, 512),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(512, num_classes)
@@ -164,13 +223,12 @@ class SMHF(nn.Module):
             x_us = x_us.repeat(1, 3, 1, 1)
 
         # 1. Feature Extraction
-        f_mlo = self.mg_stream(x_mlo) # [B, 1024, H/16, W/16]
+        f_mlo = self.mg_stream(x_mlo)
         f_cc = self.mg_stream(x_cc)
         f_us = self.us_stream(x_us)
         
         # 2. MG Intra-modality Attention
         # Concat spatially along Width (dim 3)
-        # [B, 1024, H, W] -> [B, 1024, H, 2W]
         c1 = torch.cat([f_mlo, f_cc], dim=3)
         
         a1 = self.sa1(c1)
@@ -181,15 +239,15 @@ class SMHF(nn.Module):
         f_cc_att = a1[:, :, :, w:]
         
         # Downsample
-        x11 = self.ds_11(f_mlo_att) # [B, 2048, H/2, W/2]
+        x11 = self.ds_11(f_mlo_att)
         x12 = self.ds_12(f_cc_att)
         
         # 3. US Intra-modality Attention
         a2 = self.sa2(f_us)
-        x2 = self.ds_us(a2) # [B, 2048, H/2, W/2]
+        x2 = self.ds_us(a2)
         
         # 4. Inter-modality Attention
-        # Concat spatially [x11, x12, x2] -> [B, 2048, H', 3W']
+        # Concat spatially
         ccc = torch.cat([x11, x12, x2], dim=3)
         
         a3 = self.sa3(ccc)
@@ -201,21 +259,20 @@ class SMHF(nn.Module):
         x63 = a3[:, :, :, 2*w2:]
         
         # 5. Channel-Spatial Attention
-        # Concat along Channel dimension [B, 6144, H', W']
         c6 = torch.cat([x61, x62, x63], dim=1)
         
         x3 = self.csa(c6)
         
-        # x3: [B, 6144, H', W']
-        x31 = x3[:, :2048, :, :]
-        x32 = x3[:, 2048:4096, :, :]
-        x33 = x3[:, 4096:, :, :]
+        C_d = self.C_down
+        x31 = x3[:, :C_d, :, :]
+        x32 = x3[:, C_d:2*C_d, :, :]
+        x33 = x3[:, 2*C_d:, :, :]
         
         p1 = self.avgpool(x31).view(x31.size(0), -1)
         p2 = self.avgpool(x32).view(x32.size(0), -1)
         p3 = self.avgpool(x33).view(x33.size(0), -1)
         
-        concat_img = torch.cat([p1, p2, p3], dim=1) # [B, 6144]
+        concat_img = torch.cat([p1, p2, p3], dim=1)
         
         # 6. Meta Fusion
         img_cl = self.mf(concat_img, self.cl(clinical))
