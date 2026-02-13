@@ -1,5 +1,6 @@
 import os
 import yaml
+import datetime
 import argparse
 import csv
 import torch
@@ -15,6 +16,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 from models.SMHF import SMHF
 from dataloader.load_data import split_dataset, MyDataset
+from utils.losses import FocalLoss
 
 def train(args):
     with open(args.config_path, 'r', encoding='utf-8') as f:
@@ -32,24 +34,48 @@ def train(args):
     train_dataset = MyDataset(train_info, args.config_path, use_seg=False)
     val_dataset = MyDataset(val_info, args.config_path, use_seg=False)
     
+
+    # Calculate weights for WeightedRandomSampler
+    targets = [info['label'] for info in train_info]
+    class_counts = np.bincount(targets)
+    class_weights = 1. / class_counts
+    sample_weights = [float(class_weights[t]) for t in targets]
+    sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+
     batch_size = args.batch_size
     num_workers = 4
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    # Use sampler instead of shuffle=True
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     # Initialize model with selected backbone
-    model = SMHF(num_classes=4, backbone=args.backbone).to(device)
+    model = SMHF(num_classes=args.num_classes, backbone=args.backbone).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss()
+    # Layer-wise Learning Rate
+    backbone_params = list(map(id, model.mg_stream.parameters())) + list(map(id, model.us_stream.parameters()))
+    base_params = filter(lambda p: id(p) not in backbone_params, model.parameters())
     
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
+    optimizer = optim.Adam([
+        {'params': base_params, 'lr': args.lr},
+        {'params': model.mg_stream.parameters(), 'lr': 1e-6},
+        {'params': model.us_stream.parameters(), 'lr': 1e-6}
+    ], betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4)
+
+    # Focal Loss
+    criterion = FocalLoss(alpha=0.5, gamma=2)
     
-    import datetime
+    # Warm-up Scheduler
+    warmup_epochs = 5
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / warmup_epochs
+        return 0.9 ** ((epoch - warmup_epochs) // 10)
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     start_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     experiment_name = f"{start_time}_{args.backbone}"
@@ -64,7 +90,7 @@ def train(args):
     scaler = GradScaler()
     
     epochs = args.num_epochs
-    best_val_f1 = 0.0
+    best_val_auc = 0.0
     
     # Initialize CSV logging
     csv_path = os.path.join(save_dir, 'training_metrics.csv')
@@ -133,7 +159,8 @@ def train(args):
         writer.add_scalar('Recall/train', epoch_rec, epoch)
         writer.add_scalar('Precision/train', epoch_pre, epoch)
         writer.add_scalar('AUC/train', epoch_auc, epoch)
-        writer.add_scalar('LR', scheduler.get_last_lr()[0], epoch)
+        writer.add_scalar('LR/Head', optimizer.param_groups[0]['lr'], epoch)
+        writer.add_scalar('LR/Backbone', optimizer.param_groups[1]['lr'], epoch)
         
         model.eval()
         val_loss = 0.0
@@ -193,8 +220,8 @@ def train(args):
         
         scheduler.step()
         
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
             torch.save(model.state_dict(), os.path.join(save_dir, 'best_model.pth'))
             
             best_metrics_path = os.path.join(save_dir, 'best_metrics.txt')

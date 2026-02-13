@@ -5,6 +5,7 @@ import json
 import random
 from collections import defaultdict
 import numpy as np
+import cv2
 import monai.transforms as mt
 
 def split_dataset(clinical_path, ratio=0.8):
@@ -69,79 +70,110 @@ class MyDataset(torch.utils.data.Dataset):
             mt.ToTensor(),
         ])
 
-    def crop_tumor(self, img_tensor, mask_tensor):
-        '''
-        Resize based on the location of the tumor in the masked image.
-        1. Extract an image outward from the center of the outer rectangle of the tumor with target_size.
-        2. If the cropped size cannot encompass the entire tumor, use a tumor region bounding rectangle to crop the original image and expand it by 20%, then resize it to target_size(downsample).
-        3. If the original image size is smaller than target_size, use zero padding.
-        '''
-        _, h, w = img_tensor.shape
-        target_size = self.size[0]
-        
-        # Get tumor mask indices
+    def process_mg(self, img_tensor, mask_tensor):
+        img_np = img_tensor[0].numpy()
         mask_np = mask_tensor[0].numpy()
-        rows, cols = np.where(mask_np > 0)
         
-        if len(rows) == 0:
-             # No tumor found, center cropping
-             center_r, center_c = h // 2, w // 2
-             tumor_h, tumor_w = 0, 0
-             min_r, max_r, min_c, max_c = center_r, center_r, center_c, center_c
-        else:
+        rows, cols = np.where(mask_np > 0)
+        if len(rows) > 0:
             min_r, max_r = np.min(rows), np.max(rows)
             min_c, max_c = np.min(cols), np.max(cols)
-            center_r = int((min_r + max_r) // 2)
-            center_c = int((min_c + max_c) // 2)
-            tumor_h = int(max_r - min_r + 1)
-            tumor_w = int(max_c - min_c + 1)
-
-        # Check if 512x512 centered crop contains the tumor
-        crop_half = target_size // 2
-        crop_min_r = center_r - crop_half
-        crop_max_r = crop_min_r + target_size
-        crop_min_c = center_c - crop_half
-        crop_max_c = crop_min_c + target_size
-        
-        # Check containment
-        is_contained = (crop_min_r <= min_r and crop_max_r >= max_r and 
-                        crop_min_c <= min_c and crop_max_c >= max_c)
-
-        if is_contained:
-            pad_l = max(0, -crop_min_c)
-            pad_t = max(0, -crop_min_r)
-            pad_r = max(0, crop_max_c - w)
-            pad_b = max(0, crop_max_r - h)
-            
-            if pad_l > 0 or pad_t > 0 or pad_r > 0 or pad_b > 0:
-                 img_tensor = torch.nn.functional.pad(img_tensor, (pad_l, pad_r, pad_t, pad_b), value=0)
-                 mask_tensor = torch.nn.functional.pad(mask_tensor, (pad_l, pad_r, pad_t, pad_b), value=0)
-                 # Update coordinates after padding
-                 crop_min_c += pad_l
-                 crop_min_r += pad_t
-            
-            img_crop = img_tensor[:, crop_min_r:crop_min_r+target_size, crop_min_c:crop_min_c+target_size]
-            mask_crop = mask_tensor[:, crop_min_r:crop_min_r+target_size, crop_min_c:crop_min_c+target_size]
-            return img_crop, mask_crop
-
+            img_crop = img_np[min_r:max_r+1, min_c:max_c+1]
+            mask_crop = mask_np[min_r:max_r+1, min_c:max_c+1]
         else:
-            expand_ratio = 0.2 # 外扩多少可修改
-            exp_h = int(tumor_h * expand_ratio)
-            exp_w = int(tumor_w * expand_ratio)
+            img_crop = img_np
+            mask_crop = mask_np
             
-            b_min_r = max(0, min_r - exp_h)
-            b_max_r = min(h, max_r + exp_h)
-            b_min_c = max(0, min_c - exp_w)
-            b_max_c = min(w, max_c + exp_w)
+        h, w = img_crop.shape
+        if w > 1:
+            left_sum = np.sum(img_crop[:, :w//2])
+            right_sum = np.sum(img_crop[:, w//2:])
             
-            img_crop = img_tensor[:, b_min_r:b_max_r, b_min_c:b_max_c]
-            mask_crop = mask_tensor[:, b_min_r:b_max_r, b_min_c:b_max_c]
+            if right_sum > left_sum:
+                img_crop = np.fliplr(img_crop)
+                mask_crop = np.fliplr(mask_crop)
             
-            # Resize to 512x512
-            img_crop = torch.nn.functional.interpolate(img_crop.unsqueeze(0), size=(target_size, target_size), mode='bilinear', align_corners=False).squeeze(0)
-            mask_crop = torch.nn.functional.interpolate(mask_crop.unsqueeze(0), size=(target_size, target_size), mode='nearest').squeeze(0)
+        img_uint8 = (np.clip(img_crop, 0, 1) * 255).astype(np.uint8)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        img_eq = clahe.apply(img_uint8)
+        img_crop = img_eq.astype(np.float32) / 255.0
+        
+        h, w = img_crop.shape
+        target_size = 512
+        scale = target_size / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        
+        if new_h > 0 and new_w > 0:
+            img_resized = cv2.resize(img_crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            mask_resized = cv2.resize(mask_crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        else:
+            img_resized = img_crop
+            mask_resized = mask_crop
+
+        h, w = img_resized.shape
+        delta_w = target_size - w
+        delta_h = target_size - h
+        top, bottom = delta_h // 2, delta_h - (delta_h // 2)
+        left, right = delta_w // 2, delta_w - (delta_w // 2)
+        
+        img_padded = cv2.copyMakeBorder(img_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+        mask_padded = cv2.copyMakeBorder(mask_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+        
+        return torch.tensor(img_padded).unsqueeze(0), torch.tensor(mask_padded).unsqueeze(0)
+
+    def process_us(self, img_tensor, mask_tensor):
+        img_np = img_tensor[0].numpy()
+        mask_np = mask_tensor[0].numpy()
+        h_orig, w_orig = img_np.shape
+        
+        rows, cols = np.where(mask_np > 0)
+        if len(rows) > 0:
+            min_r, max_r = np.min(rows), np.max(rows)
+            min_c, max_c = np.min(cols), np.max(cols)
             
-            return img_crop, mask_crop
+            tumor_h = max_r - min_r
+            tumor_w = max_c - min_c
+            
+            # Expand 50%
+            center_r = (min_r + max_r) / 2
+            center_c = (min_c + max_c) / 2
+            
+            new_h = tumor_h * 1.5
+            new_w = tumor_w * 1.5
+            
+            # Clamp to image boundaries
+            roi_min_r = int(max(0, center_r - new_h / 2))
+            roi_max_r = int(min(h_orig, center_r + new_h / 2))
+            roi_min_c = int(max(0, center_c - new_w / 2))
+            roi_max_c = int(min(w_orig, center_c + new_w / 2))
+            
+            img_crop = img_np[roi_min_r:roi_max_r, roi_min_c:roi_max_c]
+            mask_crop = mask_np[roi_min_r:roi_max_r, roi_min_c:roi_max_c]
+        else:
+             img_crop = img_np
+             mask_crop = mask_np
+
+        h, w = img_crop.shape
+        target_size = 512
+        if max(h, w) > 0:
+            scale = target_size / max(h, w)
+            new_h, new_w = int(h * scale), int(w * scale)
+            img_resized = cv2.resize(img_crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            mask_resized = cv2.resize(mask_crop, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        else:
+            img_resized = img_crop
+            mask_resized = mask_crop
+
+        h, w = img_resized.shape
+        delta_w = target_size - w
+        delta_h = target_size - h
+        top, bottom = delta_h // 2, delta_h - (delta_h // 2)
+        left, right = delta_w // 2, delta_w - (delta_w // 2)
+        
+        img_padded = cv2.copyMakeBorder(img_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+        mask_padded = cv2.copyMakeBorder(mask_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+        
+        return torch.tensor(img_padded).unsqueeze(0), torch.tensor(mask_padded).unsqueeze(0)
 
     def __len__(self):
         return len(self.ids)
@@ -182,10 +214,10 @@ class MyDataset(torch.utils.data.Dataset):
         mask_MG_MLO = (mask_MG_MLO > 0.5).float()
         mask_US = (mask_US > 0.5).float()
 
-        # Apply tumor crop logic
-        img_MG_CC, mask_MG_CC = self.crop_tumor(img_MG_CC, mask_MG_CC)
-        img_MG_MLO, mask_MG_MLO = self.crop_tumor(img_MG_MLO, mask_MG_MLO)
-        img_US, mask_US = self.crop_tumor(img_US, mask_US)
+        # Apply new preprocessing logic
+        img_MG_CC, mask_MG_CC = self.process_mg(img_MG_CC, mask_MG_CC)
+        img_MG_MLO, mask_MG_MLO = self.process_mg(img_MG_MLO, mask_MG_MLO)
+        img_US, mask_US = self.process_us(img_US, mask_US)
             
         # Clinical Label, 后续需要根据损失函数修改
         label = torch.tensor(self.clinical[self.ids[index]]['label'], dtype=torch.long)
