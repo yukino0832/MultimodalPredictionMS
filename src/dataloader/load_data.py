@@ -6,10 +6,10 @@ import random
 from collections import defaultdict
 import numpy as np
 import cv2
+import torchvision.transforms.functional as F
 import monai.transforms as mt
 
 def split_dataset(clinical_path, ratio=0.8):
-    '''根据临床信息划分数据集,训练集、验证集比例8:2'''
     with open(clinical_path, 'r', encoding='utf-8') as f:
         clinical_info = json.load(f)
 
@@ -31,7 +31,7 @@ def split_dataset(clinical_path, ratio=0.8):
 
 
 class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, infos, config_path, use_seg=False):
+    def __init__(self, infos, config_path, use_seg=False, is_train=False):
         with open(config_path, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
         data_dir = config['data_dir']
@@ -47,23 +47,20 @@ class MyDataset(torch.utils.data.Dataset):
         self.mask_US_dir = os.path.join(data_dir, mask_US)
         self.ids = [info['id'] for info in infos]
         self.use_seg = use_seg
+        self.is_train = is_train
         self.age_mean = config['age_mean']
         self.age_std = config['age_std']
         self.diameter_mean = config['diameter_mean']
         self.diameter_std = config['diameter_std']
         self.size = (config['img_rows'], config['img_cols'])
         
-        # MONAI transformation pipeline
-        # LoadImage loads data.nii.gz is (H, W, 1), we want (1, H, W).
-        # We use channel_dim=-1 to treat the last dimension as channel, moving it to front.
         self.transform = mt.Compose([
             mt.LoadImage(image_only=True), 
             mt.EnsureChannelFirst(channel_dim=-1),
-            mt.ScaleIntensity(),         # Scale intensity to [0, 1]
-            mt.ToTensor(),               # Convert to Tensor
+            mt.ScaleIntensity(),         
+            mt.ToTensor(),               
         ])
         
-        # Mask transform: Load -> Channel First -> Threshold -> Tensor
         self.mask_transform = mt.Compose([
             mt.LoadImage(image_only=True),
             mt.EnsureChannelFirst(channel_dim=-1),
@@ -134,14 +131,12 @@ class MyDataset(torch.utils.data.Dataset):
             tumor_h = max_r - min_r
             tumor_w = max_c - min_c
             
-            # Expand 50%
             center_r = (min_r + max_r) / 2
             center_c = (min_c + max_c) / 2
             
             new_h = tumor_h * 1.5
             new_w = tumor_w * 1.5
             
-            # Clamp to image boundaries
             roi_min_r = int(max(0, center_r - new_h / 2))
             roi_max_r = int(min(h_orig, center_r + new_h / 2))
             roi_min_c = int(max(0, center_c - new_w / 2))
@@ -214,49 +209,13 @@ class MyDataset(torch.utils.data.Dataset):
         mask_MG_MLO = (mask_MG_MLO > 0.5).float()
         mask_US = (mask_US > 0.5).float()
 
-        # Apply new preprocessing logic
         img_MG_CC, mask_MG_CC = self.process_mg(img_MG_CC, mask_MG_CC)
         img_MG_MLO, mask_MG_MLO = self.process_mg(img_MG_MLO, mask_MG_MLO)
         img_US, mask_US = self.process_us(img_US, mask_US)
-            
-        # Clinical Label, 后续需要根据损失函数修改
+        
         label = torch.tensor(self.clinical[self.ids[index]]['label'], dtype=torch.long)
         
         if self.use_seg:
             return (img_MG_CC, mask_MG_CC), (img_MG_MLO, mask_MG_MLO), (img_US, mask_US), label, clinical
         else:
             return img_MG_CC, img_MG_MLO, img_US, label, clinical
-
-def test():
-    clinical_path = '/home/yukino/Research/MultimodalPredictionMS/configs/clinical.json'
-    config_path = '/home/yukino/Research/MultimodalPredictionMS/configs/config.yaml'
-    
-    train_info, val_info = split_dataset(clinical_path)
-    
-    print(f"Train samples: {len(train_info)}")
-    
-    # Test with use_seg=False
-    print("Testing use_seg=False...")
-    train_dataset = MyDataset(train_info, config_path, use_seg=False)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=2, shuffle=True)
-    
-    for batch in train_loader:
-        img_cc, img_mlo, img_us, labels, clinical = batch
-        print(f"img_CC: {img_cc.shape}, img_MLO: {img_mlo.shape}, img_US: {img_us.shape}, labels: {labels.shape}, clinical: {clinical.shape}")
-        break  # Just one batch
-    
-    # Test with use_seg=True
-    print("\nTesting use_seg=True...")
-    train_dataset_seg = MyDataset(train_info, config_path, use_seg=True)
-    train_loader_seg = torch.utils.data.DataLoader(train_dataset_seg, batch_size=2, shuffle=True)
-    
-    for batch in train_loader_seg:
-        (img_cc, mask_cc), (img_mlo, mask_mlo), (img_us, mask_us), labels, clinical = batch
-        print(f"img_CC: {img_cc.shape}, mask_CC: {mask_cc.shape}")
-        print(f"img_MLO: {img_mlo.shape}, mask_MLO: {mask_mlo.shape}")
-        print(f"img_US: {img_us.shape}, mask_US: {mask_us.shape}")
-        print(f"labels: {labels.shape}, clinical: {clinical.shape}")
-        break
-
-if __name__ == '__main__':
-    test()

@@ -3,18 +3,20 @@ import yaml
 import datetime
 import argparse
 import csv
+from collections import Counter
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, recall_score, precision_score, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, recall_score, precision_score, roc_auc_score
 import numpy as np
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
 
-from models.SMHF import SMHF
+from models.MSHF import MSHF
+from models.MSHF_ViT import MSHF_ViT
 from dataloader.load_data import split_dataset, MyDataset
 from utils.losses import FocalLoss
 
@@ -31,54 +33,67 @@ def train(args):
     print("Loading data...")
     train_info, val_info = split_dataset(clinical_path)
     
-    train_dataset = MyDataset(train_info, args.config_path, use_seg=False)
-    val_dataset = MyDataset(val_info, args.config_path, use_seg=False)
+    train_dataset = MyDataset(train_info, args.config_path, use_seg=True, is_train=True)
+    val_dataset = MyDataset(val_info, args.config_path, use_seg=True, is_train=False)
     
 
-    # Calculate weights for WeightedRandomSampler
-    targets = [info['label'] for info in train_info]
-    class_counts = np.bincount(targets)
-    class_weights = 1. / class_counts
-    sample_weights = [float(class_weights[t]) for t in targets]
-    sampler = torch.utils.data.WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+
 
     batch_size = args.batch_size
     num_workers = 4
     
-    # Use sampler instead of shuffle=True
+    train_labels = [info['label'] for info in train_info]
+    counts = Counter(train_labels)
+    class_sample_weights = {cls: 1.0 / cnt for cls, cnt in counts.items()}
+    sample_weights = [class_sample_weights[lbl] for lbl in train_labels]
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    if args.model == 'MSHF_ViT':
+        model = MSHF_ViT(num_classes=args.num_classes, backbone=args.backbone).to(device)
+    else:
+        model = MSHF(num_classes=args.num_classes, backbone=args.backbone).to(device)
+    for name, param in model.mg_backbone.named_parameters():
+        if '7' in name.split('.')[0] or 'denseblock4' in name or 'norm5' in name or 'Mixed_7' in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+            
+    for name, param in model.us_backbone.named_parameters():
+        if '7' in name.split('.')[0] or 'denseblock4' in name or 'norm5' in name or 'Mixed_7' in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+    head_params = [p for n, p in model.named_parameters() if 'mg_backbone' not in n and 'us_backbone' not in n]
     
-    # Initialize model with selected backbone
-    model = SMHF(num_classes=args.num_classes, backbone=args.backbone).to(device)
+    mg_params = [p for p in model.mg_backbone.parameters() if p.requires_grad]
+    us_params = [p for p in model.us_backbone.parameters() if p.requires_grad]
     
-    # Layer-wise Learning Rate
-    backbone_params = list(map(id, model.mg_stream.parameters())) + list(map(id, model.us_stream.parameters()))
-    base_params = filter(lambda p: id(p) not in backbone_params, model.parameters())
-    
-    optimizer = optim.Adam([
-        {'params': base_params, 'lr': args.lr},
-        {'params': model.mg_stream.parameters(), 'lr': 1e-6},
-        {'params': model.us_stream.parameters(), 'lr': 1e-6}
+    optimizer = optim.AdamW([
+        {'params': mg_params, 'lr': 1e-6},
+        {'params': us_params, 'lr': 1e-6},
+        {'params': head_params, 'lr': args.lr}
     ], betas=(0.9, 0.999), eps=1e-08, weight_decay=1e-4)
 
-    # Focal Loss
-    criterion = FocalLoss(alpha=0.5, gamma=2)
+    total = sum(counts.values())
+    num_classes_detected = args.num_classes
+    alpha_vals = [total / (num_classes_detected * counts.get(i, 1)) for i in range(num_classes_detected)]
+    alpha_sum  = sum(alpha_vals)
+    alpha = torch.tensor([v / alpha_sum for v in alpha_vals], dtype=torch.float32).to(device)
+    criterion = FocalLoss(alpha=alpha, gamma=2)
     
-    # Warm-up Scheduler
-    warmup_epochs = 5
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return float(epoch + 1) / warmup_epochs
-        return 0.9 ** ((epoch - warmup_epochs) // 10)
-
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=15, min_lr=1e-7
+    )
     
     start_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    experiment_name = f"{start_time}_{args.backbone}"
+    experiment_name = f"{start_time}_{args.model}_{args.backbone}"
     
     save_dir = os.path.join('checkpoints', experiment_name)
     os.makedirs(save_dir, exist_ok=True)
@@ -86,13 +101,11 @@ def train(args):
     log_dir = os.path.join('runs', experiment_name)
     writer = SummaryWriter(log_dir=log_dir)
     
-    # Initialize GradScaler for AMP
     scaler = GradScaler()
     
     epochs = args.num_epochs
     best_val_auc = 0.0
     
-    # Initialize CSV logging
     csv_path = os.path.join(save_dir, 'training_metrics.csv')
     with open(csv_path, 'w', newline='') as f:
         writer_csv = csv.writer(f)
@@ -108,25 +121,29 @@ def train(args):
         
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
         for batch in loop:
-            # Unpack batch
-            # img_MG_CC, img_MG_MLO, img_US, label, clinical
-            img_cc, img_mlo, img_us, labels, clinical = batch
+            (img_cc, mask_cc), (img_mlo, mask_mlo), (img_us, mask_us), labels, clinical = batch
             
             img_cc = img_cc.to(device)
             img_mlo = img_mlo.to(device)
             img_us = img_us.to(device)
             labels = labels.to(device)
             clinical = clinical.to(device)
+            mask_cc = mask_cc.to(device)
+            mask_mlo = mask_mlo.to(device)
+            mask_us = mask_us.to(device)
             
             optimizer.zero_grad()
             
-            # Use autocast for mixed precision training
             with autocast():
-                outputs = model(img_mlo, img_cc, img_us, clinical)
-                loss = criterion(outputs, labels)
+                outputs, out_mg, out_us = model(img_mlo, img_cc, img_us, clinical, mask_mlo, mask_cc, mask_us)
+                loss_main = criterion(outputs, labels)
+                loss_mg = criterion(out_mg, labels)
+                loss_us = criterion(out_us, labels)
+                loss = loss_main + 0.3 * loss_mg + 0.3 * loss_us
             
-            # Scale loss and backward
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
@@ -141,12 +158,11 @@ def train(args):
             
         epoch_loss = running_loss / len(train_dataset)
         epoch_acc = accuracy_score(all_labels, all_preds)
-        epoch_f1 = f1_score(all_labels, all_preds, average='macro')
-        epoch_rec = recall_score(all_labels, all_preds, average='macro')
-        epoch_pre = precision_score(all_labels, all_preds, average='macro')
+        epoch_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        epoch_rec = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+        epoch_pre = precision_score(all_labels, all_preds, average='macro', zero_division=0)
         try:
             if args.num_classes == 2:
-                # For binary classification, use probability of positive class
                 epoch_auc = roc_auc_score(all_labels, np.array(all_probs)[:, 1])
             else:
                 epoch_auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
@@ -159,8 +175,6 @@ def train(args):
         writer.add_scalar('Recall/train', epoch_rec, epoch)
         writer.add_scalar('Precision/train', epoch_pre, epoch)
         writer.add_scalar('AUC/train', epoch_auc, epoch)
-        writer.add_scalar('LR/Head', optimizer.param_groups[0]['lr'], epoch)
-        writer.add_scalar('LR/Backbone', optimizer.param_groups[1]['lr'], epoch)
         
         model.eval()
         val_loss = 0.0
@@ -170,15 +184,18 @@ def train(args):
         
         with torch.no_grad():
             for batch in val_loader:
-                img_cc, img_mlo, img_us, labels, clinical = batch
+                (img_cc, mask_cc), (img_mlo, mask_mlo), (img_us, mask_us), labels, clinical = batch
                 
                 img_cc = img_cc.to(device)
                 img_mlo = img_mlo.to(device)
                 img_us = img_us.to(device)
                 labels = labels.to(device)
                 clinical = clinical.to(device)
+                mask_cc = mask_cc.to(device)
+                mask_mlo = mask_mlo.to(device)
+                mask_us = mask_us.to(device)
                 
-                outputs = model(img_mlo, img_cc, img_us, clinical)
+                outputs = model(img_mlo, img_cc, img_us, clinical, mask_mlo, mask_cc, mask_us)
                 loss = criterion(outputs, labels)
                 
                 val_loss += loss.item() * labels.size(0)
@@ -190,9 +207,9 @@ def train(args):
         
         val_loss = val_loss / len(val_dataset)
         val_acc = accuracy_score(val_labels, val_preds)
-        val_f1 = f1_score(val_labels, val_preds, average='macro')
-        val_rec = recall_score(val_labels, val_preds, average='macro')
-        val_pre = precision_score(val_labels, val_preds, average='macro')
+        val_f1 = f1_score(val_labels, val_preds, average='macro', zero_division=0)
+        val_rec = recall_score(val_labels, val_preds, average='macro', zero_division=0)
+        val_pre = precision_score(val_labels, val_preds, average='macro', zero_division=0)
         try:
             if args.num_classes == 2:
                 val_auc = roc_auc_score(val_labels, np.array(val_probs)[:, 1])
@@ -218,7 +235,7 @@ def train(args):
             writer_csv.writerow([epoch+1, epoch_loss, epoch_acc, epoch_f1, epoch_rec, epoch_pre, epoch_auc,
                                  val_loss, val_acc, val_f1, val_rec, val_pre, val_auc])
         
-        scheduler.step()
+        scheduler.step(val_auc)
         
         if val_auc > best_val_auc:
             best_val_auc = val_auc
@@ -244,8 +261,11 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--backbone', type=str, default='resnet18', 
-                        choices=['resnet18', 'resnet34', 'resnet50', 'densenet121', 'inceptionv3'],
+    parser.add_argument('--model', type=str, default='MSHF',
+                        choices=['MSHF', 'MSHF_ViT'],
+                        help='Model variant to train (MSHF: original, MSHF_ViT: ViT-based fusion)')
+    parser.add_argument('--backbone', type=str, default='ResNet50', 
+                        choices=['ResNet50', 'DenseNet121', 'InceptionV3'],
                         help='Backbone model for feature extraction')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes for classification')
     args = parser.parse_args()
